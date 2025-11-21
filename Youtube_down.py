@@ -1,8 +1,10 @@
-from pytube import YouTube
+import yt_dlp
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
 import time
+import os
+import glob
 
 # Modern color scheme
 BG_COLOR = "#2b2b2b"
@@ -41,39 +43,139 @@ def get_and_download():
     status_label.config(text="Downloading...", fg=ACCENT_COLOR)
     threading.Thread(target=down_video, args=(url, file_path,)).start()
 
-def down_video(url, file_path):
+# Global variables for progress tracking
+download_info = {'total_bytes': 0, 'downloaded_bytes': 0, 'filename': ''}
+
+def progress_hook(d):
     try:
-        yt = YouTube(url, on_progress_callback=data_bar)
-        ytvh = yt.streams.get_highest_resolution()
-        ytvh.download(file_path)
+        if d['status'] == 'downloading':
+            # Get total and downloaded bytes
+            total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+            downloaded = d.get('downloaded_bytes', 0)
+            
+            # Store in global for file monitoring
+            if total > 0:
+                download_info['total_bytes'] = total
+                download_info['downloaded_bytes'] = downloaded
+                percent = min((downloaded / total) * 100, 100)
+                down_bar["value"] = percent
+                
+                # Update status with speed
+                speed = d.get('_speed_str', '')
+                if speed:
+                    status_label.config(text=f"Downloading... {speed}", fg=ACCENT_COLOR)
+                else:
+                    status_label.config(text="Downloading...", fg=ACCENT_COLOR)
+                
+                main_window.update_idletasks()
+            else:
+                # If no total_bytes, try to get from filename
+                filename = d.get('filename', '')
+                if filename and os.path.exists(filename):
+                    file_size = os.path.getsize(filename)
+                    if file_size > download_info['downloaded_bytes']:
+                        download_info['downloaded_bytes'] = file_size
+                        # Estimate progress based on file growth
+                        if download_info['total_bytes'] > 0:
+                            percent = min((file_size / download_info['total_bytes']) * 100, 100)
+                            down_bar["value"] = percent
+                            main_window.update_idletasks()
+        
+        elif d['status'] == 'finished':
+            down_bar["value"] = 100
+            status_label.config(text="Processing...", fg=ACCENT_COLOR)
+            main_window.update_idletasks()
+    except:
+        pass
+
+def monitor_file_progress(expected_filename, total_size):
+    """Monitor file size to update progress bar"""
+    while download_button['state'] == 'disabled':
+        try:
+            if os.path.exists(expected_filename):
+                current_size = os.path.getsize(expected_filename)
+                if total_size > 0:
+                    percent = min((current_size / total_size) * 100, 99)  # Max 99% until finished
+                    down_bar["value"] = percent
+                    main_window.update_idletasks()
+            time.sleep(0.5)  # Check every 0.5 seconds
+        except:
+            pass
+
+def down_video(url, file_path):
+    global download_info
+    try:
+        # Reset progress bar and info
+        down_bar["value"] = 0
+        download_info = {'total_bytes': 0, 'downloaded_bytes': 0, 'filename': ''}
+        status_label.config(text="Getting video info...", fg=ACCENT_COLOR)
+        main_window.update_idletasks()
+        
+        ydl_opts = {
+            'format': 'best[ext=mp4]/best',
+            'outtmpl': os.path.join(file_path, '%(title)s.%(ext)s'),
+            'progress_hooks': [progress_hook],
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Get video info first
+            info = ydl.extract_info(url, download=False)
+            video_title = info.get('title', 'Unknown')
+            video_views = info.get('view_count', 0)
+            
+            # Get expected file size
+            formats = info.get('formats', [])
+            best_format = None
+            for fmt in formats:
+                if fmt.get('vcodec') != 'none' and fmt.get('acodec') != 'none':
+                    best_format = fmt
+                    break
+            if not best_format:
+                best_format = formats[-1] if formats else {}
+            
+            total_size = best_format.get('filesize') or best_format.get('filesize_approx', 0)
+            download_info['total_bytes'] = total_size
+            
+            # Get expected filename
+            filename_template = ydl_opts['outtmpl']
+            safe_title = ydl.prepare_filename({'title': video_title, 'ext': 'mp4'})
+            expected_filename = os.path.join(file_path, os.path.basename(safe_title))
+            download_info['filename'] = expected_filename
+            
+            status_label.config(text="Starting download...", fg=ACCENT_COLOR)
+            main_window.update_idletasks()
+            
+            # Start file monitoring thread
+            if total_size > 0:
+                monitor_thread = threading.Thread(target=monitor_file_progress, args=(expected_filename, total_size), daemon=True)
+                monitor_thread.start()
+            
+            # Download the video
+            ydl.download([url])
+            
         entry1.delete(0, tk.END)
-        down_message(url)
+        down_message(video_title, video_views)
     except Exception as e:
-        messagebox.showerror("Error", f"An error occurred while downloading:\n{str(e)}")
+        error_msg = str(e)
+        if "HTTP Error 403" in error_msg or "HTTP Error 400" in error_msg:
+            error_msg = "YouTube access denied. Please try again later or check your internet connection."
+        messagebox.showerror("Error", f"An error occurred while downloading:\n{error_msg}")
         status_label.config(text="Error", fg="#ff4444")
         download_button.config(state="normal")
+        down_bar["value"] = 0
 
-def down_message(url):
+def down_message(title, views):
     try:
-        yt = YouTube(url)
         messagebox.showinfo("Download Complete", 
-                          f"Başlık: {yt.title}\nGörüntülenme: {yt.views:,}")
+                          f"Title: {title}\nViews: {views:,}")
     except:
         messagebox.showinfo("Download Complete", "Video successfully downloaded!")
     
     down_bar["value"] = 0
     status_label.config(text="Ready", fg="#4caf50")
     download_button.config(state="normal")
-
-def data_bar(stream, chunk, bytes_remaining):
-    total_size = stream.filesize
-    bytes_downloaded = total_size - bytes_remaining
-    completion = (bytes_downloaded / total_size) * 100
-
-    while down_bar["value"] < completion:
-        down_bar["value"] += 1
-        main_window.update_idletasks()
-        time.sleep(0.02)
 
 def on_button_hover(event, button, hover_color):
     button.config(bg=hover_color)
@@ -259,22 +361,7 @@ try:
     download_button.bind("<Enter>", lambda e: on_button_hover(e, download_button, BUTTON_HOVER))
     download_button.bind("<Leave>", lambda e: on_button_leave(e, download_button, BUTTON_BG))
     
-    exit_button = tk.Button(button_frame,
-                            text="Exit",
-                            font=("Segoe UI", 11),
-                            bg=BUTTON_SECONDARY,
-                            fg=FG_COLOR,
-                            activebackground=BUTTON_SECONDARY_HOVER,
-                            activeforeground=FG_COLOR,
-                            relief=tk.FLAT,
-                            bd=0,
-                            padx=30,
-                            pady=12,
-                            cursor="hand2",
-                            command=main_window.quit)
-    exit_button.pack(side=tk.LEFT)
-    exit_button.bind("<Enter>", lambda e: on_button_hover(e, exit_button, BUTTON_SECONDARY_HOVER))
-    exit_button.bind("<Leave>", lambda e: on_button_leave(e, exit_button, BUTTON_SECONDARY))
+    
     
     # Status Label
     status_label = tk.Label(main_frame,
